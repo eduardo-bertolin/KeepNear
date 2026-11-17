@@ -1,47 +1,48 @@
 # KeepNear — Sistema IoT de Rastreamento de Proximidade
 
-Sistema de localização de objetos pessoais baseado em **Bluetooth Low Energy (BLE)**, composto por uma tag inteligente embarcada em **ESP32-C6** e um aplicativo mobile desenvolvido em **React Native (Expo)**. O projeto combina filtragem digital de sinal (EMA), feedback tátil dinâmico, acionamento sonoro remoto via GATT e registro local de última localização por GPS (*Privacy by Design*).
+Sistema completo de localização de objetos pessoais baseado em **Bluetooth Low Energy (BLE)**, composto por uma tag inteligente embarcada em **ESP32-C6** e um aplicativo mobile desenvolvido em **React Native (Expo)**. O projeto combina leitura de sensor térmico interno, decisões autônomas offline no microcontrolador, filtragem digital de sinal (EMA), feedback tátil dinâmico e registro local de última localização por GPS (*Privacy by Design*).
 
 ---
 
-## 🏗️ Arquitetura do Sistema
+## 🏗️ Arquitetura e Requisitos Atendidos
 
-O ecossistema é dividido em duas camadas desacopladas que se comunicam via protocolo BLE:
+O ecossistema é dividido em duas camadas desacopladas que operam sem dependência de internet ou servidores em nuvem:
 
-1. **Firmware Embarcado (`nanoESP32-C6` / `ESP32-C6`):**
-   * Atua como periférico BLE emitindo pacotes contínuos de *Advertising* com dados do fabricante (*Manufacturer Data*).
-   * Expõe um servidor **GATT** para receber comandos de acionamento do buzzer piezoelétrico.
-   * Não possui módulo GPS integrado, garantindo baixo consumo energético e privacidade física do hardware.
+1. **Firmware Embarcado (`src/main.cpp` — `ESP32-C6` / `nanoESP32-C6`):**
+   * **Percepção e Ação (R1):** Monitora continuamente o sensor interno de temperatura do silício (`temperatureRead()`) a cada `2000 ms` e aciona o buzzer piezoelétrico (`GPIO 6`, PWM via `ledcAttach`) caso a placa atinja o limiar crítico de **65,0 °C** (`playThermalAlert()`).
+   * **Decisão Local Autônoma (R2):** Executa duas regras localmente no microcontrolador sem depender do smartphone ou de internet:
+     1. *Proteção térmica ($\ge 65,0\,^\circ\text{C}$):* disparo automático de 4 bipes agudos (`1200 Hz`).
+     2. *Alerta anti-esquecimento (`onDisconnect`):* ao detectar a perda do enlace BLE com o celular, emite **3 bipes curtos** (`880 Hz` / `NOTE_A5`) na própria tag e reinicia o *Advertising* para permitir reconexão.
+   * **Comunicação BLE e Segurança (R3 / R4):** Atua como periférico BLE enviando pacotes estruturados de *Advertising* e expondo um servidor **GATT** que valida o payload recebido (`rxValue == "1"` / `0x31`) antes de executar a melodia de localização (`playMarioTheme()`).
 
-2. **Aplicativo Mobile (`keep-near-app`):**
-   * Desenvolvido em **React Native + TypeScript** utilizando `react-native-ble-plx` e `expo-location`.
-   * Realiza varredura contínua, leitura de RSSI em tempo real (intervalo de `200 ms` quando conectado), filtragem de ruído e cálculo percentual de proximidade.
-   * Gerencia a geolocalização **exclusivamente no smartphone**, capturando coordenadas e endereço apenas no dispositivo do proprietário.
+2. **Aplicativo Mobile (`keep-near-app/App.tsx`):**
+   * **Interface e Telemetria (R5):** Desenvolvido em **React Native + TypeScript** (`react-native-ble-plx` e `expo-location`), exibe em tempo real o percentual de proximidade, tendência do sinal (`↑`, `↓`, `•`), pico de aproximação, fonte de energia e status de sincronização sem necessidade de Monitor Serial.
+   * **Privacy by Design:** A tag não possui receptor GPS nem transmite coordenadas pela rede. A geolocalização é capturada e armazenada exclusivamente no smartphone do proprietário no momento do cadastro, conexão ou desconexão BLE.
 
 ---
 
-## ⚙️ Como o Código Funciona
+## ⚙️ Protocolo e Algoritmos
 
-### 1. Protocolo BLE e Telemetria (`App.tsx`)
+### 1. Payload Estruturado (BLE Advertising & GATT)
 * **Service UUID:** `4fafc201-1fb5-459e-8fcc-c5c9c331914b`
 * **Characteristic UUID (Buzzer):** `beb5483e-36e1-4688-b7f5-ea07361b26aa`
-* **Decodificação de *Manufacturer Data*:** A função `parseManufacturerData()` decodifica a string Base64 recebida no pacote de anúncio para extrair:
-  * **Hardware ID (4 bytes):** Identificador único exibido no formato hexadecimal (`XX:XX:XX:XX`).
-  * **Fonte de Energia (1 byte):** Identifica alimentação via `USB` (`0xFF`) ou percentual de bateria.
-* **Acionamento Sonoro:** Ao tocar em **"Tocar Som na Tag"**, o aplicativo envia o payload `'MQ=='` (caractere `'1'` em Base64) para a característica GATT, disparando o alerta sonoro na tag.
+* **Comando de Acionamento (GATT Write):** String `'1'` (`0x31` em ASCII / `'MQ=='` em Base64). Qualquer outro payload é descartado pelo firmware.
+* **Manufacturer Data (8 bytes):**
 
-### 2. Algoritmo de Proximidade e Filtro EMA
-Como sinais de rádio de 2.4 GHz sofrem atenuação e reflexões constantes, o aplicativo trata o sinal bruto em três etapas:
+| Byte(s) | Campo | Exemplo (Hex) | Descrição |
+| :--- | :--- | :--- | :--- |
+| `0..1` | Company ID | `0xFF 0xFF` | Identificador de fabricante para testes/prototipagem |
+| `2..5` | Hardware ID | `0x01 0x02 0x03 0x04` | Identificador único da tag exibido como `01:02:03:04` |
+| `6` | Reservado | `0x00` | Byte reservado para expansão futura |
+| `7` | Fonte de Energia | `0xFF` | `0xFF` indica alimentação `USB`; `0x00–0x64` indica `%` de bateria |
 
-1. **Suavização Exponencial (EMA):** Aplica um fator de amortecimento $\alpha = 0.28$ para eliminar picos espúrios sem perder responsividade ao movimento:
+### 2. Filtragem de Proximidade (EMA) e Feedback Tátil
+Para estabilizar oscilações de rádio em 2,4 GHz durante leituras contínuas (`200 ms`):
+1. **Filtro EMA ($\alpha = 0.28$):**
    $$\text{RSSI}_{\text{suavizado}} = \text{RSSI}_{\text{anterior}} + 0.28 \times (\text{RSSI}_{\text{atual}} - \text{RSSI}_{\text{anterior}})$$
-2. **Normalização e Curva Não-Linear:** Mapeia o sinal calibrado entre `-97 dBm` (0%) e `-51 dBm` (100%) e aplica um expoente de curva (`0.65`) para tornar a escala percentual mais intuitiva conforme o usuário se aproxima:
+2. **Curva de Proximidade Calibrada (`-97 dBm` a `-51 dBm`):**
    $$\text{Força (\%)} = \text{round}\left(\left(\frac{\text{RSSI} - (-97)}{-51 - (-97)}\right)^{0.65} \times 100\right)$$
-3. **Tendência e Pulso Tátil:** Calcula o delta entre leituras consecutivas ($\pm 0.8\text{ dBm}$) para indicar se o sinal está subindo (`↑`), caindo (`↓`) ou estável (`•`), ajustando a frequência de vibração do smartphone (de `1500 ms` distante até `200 ms` quando a proximidade atinge $\ge 85\%$).
-
-### 3. Geolocalização ("Visto por Último")
-* **Gatilhos Automáticos (`captureTagLocation`):** A posição GPS do smartphone é capturada e convertida em endereço legível via geocodificação reversa (`Location.reverseGeocodeAsync`) no cadastro da tag, no início do rastreamento e automaticamente no evento de perda de enlace (`connectedDevice.onDisconnected`).
-* **Integração com Mapas (`openTagInMaps`):** Ao tocar no endereço ou no botão **"Ver no Mapa"**, o app abre diretamente o Apple Maps (iOS) ou Google Maps (Android) nas coordenadas salvas.
+3. **Pulso Tátil:** Ajusta o intervalo de vibração do smartphone conforme a intensidade do sinal (de `1500 ms` distante até `200 ms` quando $\ge 85\%$).
 
 ---
 
@@ -50,23 +51,25 @@ Como sinais de rádio de 2.4 GHz sofrem atenuação e reflexões constantes, o a
 ```text
 KeepNear/
 ├── src/
-│   └── main.cpp              # Firmware C++ do ESP32-C6 (BLE Advertising + GATT Buzzer)
-├── platformio.ini            # Configurações de compilação e placa (ESP32-C6)
+│   └── main.cpp              # Firmware C++ do ESP32-C6 (BLE, Sensor Térmico 65 °C e Buzzer)
+├── platformio.ini            # Configuração da placa ESP32-C6 e flags de build
+├── .env.example              # Exemplo de parâmetros e UUIDs de configuração
+├── .gitignore                # Arquivos e pastas ignorados no controle de versão
 └── keep-near-app/
-    ├── App.tsx               # Código principal do aplicativo (Lista, Radar EMA, BLE e GPS)
-    ├── app.json              # Configurações do Expo e permissões nativas (BLE / GPS)
-    └── package.json          # Dependências do projeto React Native
+    ├── App.tsx               # Aplicação React Native (Radar EMA, BLE GATT e GPS local)
+    ├── app.json              # Permissões nativas de Bluetooth e Localização (iOS/Android)
+    └── package.json          # Dependências do aplicativo mobile
 ```
 
 ---
 
 ## 🛠️ Pré-requisitos
 
-* **Hardware:** Placa ESP32-C6 (ex: *nanoESP32-C6*) com buzzer conectado e cabo USB-C.
+* **Hardware:** Placa ESP32-C6 (ex.: *nanoESP32-C6*) com buzzer conectado ao `GPIO 6` e cabo USB-C.
 * **Firmware:** [VS Code](https://code.visualstudio.com/) com a extensão **PlatformIO IDE**.
-* **Mobile:** [Node.js](https://nodejs.org/) (v18+), **Xcode** (para compilar no iOS) ou **Android Studio**, e um dispositivo físico com Bluetooth ativado.
+* **Mobile:** [Node.js](https://nodejs.org/) (v18+), **Xcode** (para build iOS) ou **Android Studio**, e dispositivo físico com Bluetooth e GPS ativados.
 
-> **Nota:** Como o projeto utiliza bibliotecas nativas de Bluetooth (`react-native-ble-plx`), o aplicativo deve ser executado via **Development Build** (`expo run:ios` / `expo run:android`), e não pelo aplicativo padrão Expo Go.
+> **Nota:** Como o projeto utiliza módulos nativos de Bluetooth (`react-native-ble-plx`), ele deve ser executado via **Development Build** (`expo run:ios` / `expo run:android`), e não pelo Expo Go padrão.
 
 ---
 
@@ -80,11 +83,12 @@ cd KeepNear
 
 ### 2. Gravar o Firmware no ESP32-C6
 1. Abra a pasta raiz `KeepNear` no **VS Code** com o **PlatformIO** instalado.
-2. Conecte a placa **ESP32-C6** ao computador via USB.
-3. Compile e faça o upload do firmware clicando no ícone **PlatformIO: Upload** (`→`) na barra inferior ou executando no terminal:
+2. Conecte o **ESP32-C6** via USB.
+3. Compile e envie o firmware pelo ícone **PlatformIO: Upload** (`→`) ou via terminal:
    ```bash
    pio run --target upload
    ```
+   *(Ao energizar a placa, o buzzer tocará a melodia inicial confirmando que o anúncio BLE está ativo).*
 
 ### 3. Instalar e Executar o Aplicativo Mobile
 1. Acesse o diretório do aplicativo e instale as dependências:
@@ -92,14 +96,7 @@ cd KeepNear
    cd keep-near-app
    npm install
    ```
-2. Certifique-se de que os plugins do Bluetooth e da Localização estão declarados no `app.json`:
-   ```json
-   "plugins": [
-     "react-native-ble-plx",
-     "expo-location"
-   ]
-   ```
-3. Compile e instale o app no dispositivo físico conectado via USB:
+2. Compile e instale o app no dispositivo físico conectado via USB:
    * **iOS (macOS + Xcode):**
      ```bash
      npx expo run:ios --device
@@ -108,16 +105,7 @@ cd KeepNear
      ```bash
      npx expo run:android --device
      ```
-4. Caso o build nativo já esteja instalado no aparelho, basta iniciar o servidor de desenvolvimento:
+3. Caso o build nativo já esteja instalado no aparelho, inicie apenas o servidor de desenvolvimento:
    ```bash
    npx expo start --dev-client
    ```
-
----
-
-## 📱 Fluxo de Uso
-
-1. **Cadastrar Tag:** Toque em **"+ Cadastrar Nova Tag"**, aguarde a identificação automática do pacote BLE da placa ESP32-C6, escolha um ícone e dê um nome ao objeto.
-2. **Rastrear em Tempo Real:** Selecione o item na lista e toque em **"Localizar Agora"** para acompanhar o percentual de proximidade, o gráfico de tendência e o feedback tátil.
-3. **Acionar Alarme:** Com a tag conectada, toque em **"🔔 Tocar Som na Tag"** para emitir o sinal sonoro no hardware.
-4. **Consultar Última Localização:** Caso a tag saia do alcance Bluetooth, o endereço da última conexão permanece salvo no card do item e pode ser aberto diretamente no mapa.
