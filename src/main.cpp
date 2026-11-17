@@ -4,12 +4,14 @@
 #include <BLEUtils.h>
 
 #define BUZZER_PIN 6
+#define TEMP_LIMIT_CELSIUS 65.0f
 
 // Notas musicais (Hz)
 #define NOTE_G4 392
 #define NOTE_C5 523
 #define NOTE_E5 659
 #define NOTE_G5 784
+#define NOTE_A5 880
 
 #define SERVICE_UUID     "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define BUZZER_CHAR_UUID "beb5483e-36e1-4688-b7f5-ea07361b26aa"
@@ -17,6 +19,13 @@
 BLEServer* pServer = nullptr;
 bool deviceConnected = false;
 volatile bool shouldPlayMario = false;
+volatile bool shouldPlayDisconnect = false;
+unsigned long lastTempCheck = 0;
+
+void silenceBuzzer() {
+  ledcWriteTone(BUZZER_PIN, 0);
+  ledcWrite(BUZZER_PIN, 0);
+}
 
 void playMarioTheme() {
   int melody[] = {
@@ -37,20 +46,36 @@ void playMarioTheme() {
 
   for (int i = 0; i < notesCount; i++) {
     if (melody[i] == 0) {
-      ledcWriteTone(BUZZER_PIN, 0);
-      ledcWrite(BUZZER_PIN, 0);
+      silenceBuzzer();
     } else {
       ledcWriteTone(BUZZER_PIN, melody[i]);
     }
     delay(durations[i]);
-    ledcWriteTone(BUZZER_PIN, 0);
-    ledcWrite(BUZZER_PIN, 0);
+    silenceBuzzer();
     delay(25);
   }
 
-  // Garante saída em 0V (silêncio absoluto após tocar)
-  ledcWriteTone(BUZZER_PIN, 0);
-  ledcWrite(BUZZER_PIN, 0);
+  silenceBuzzer();
+}
+
+// Regra local R2: 3 bipes curtos ao perder conexão com o smartphone
+void playDisconnectAlert() {
+  for (int i = 0; i < 3; i++) {
+    ledcWriteTone(BUZZER_PIN, NOTE_A5);
+    delay(110);
+    silenceBuzzer();
+    delay(90);
+  }
+}
+
+// Regra local R1: alerta térmico caso o chip ultrapasse 65 °C
+void playThermalAlert() {
+  for (int i = 0; i < 4; i++) {
+    ledcWriteTone(BUZZER_PIN, 1200);
+    delay(80);
+    silenceBuzzer();
+    delay(60);
+  }
 }
 
 class ServerCallbacks : public BLEServerCallbacks {
@@ -61,20 +86,30 @@ class ServerCallbacks : public BLEServerCallbacks {
 
   void onDisconnect(BLEServer* server) override {
     deviceConnected = false;
+    shouldPlayDisconnect = true;
     Serial.println("[BLE] iPhone desconectado. Reiniciando anuncio...");
     BLEDevice::startAdvertising();
   }
 };
 
 class BuzzerCallbacks : public BLECharacteristicCallbacks {
+  void handleWrite(BLECharacteristic* pCharacteristic) {
+    String rxValue = pCharacteristic->getValue();
+    // Valida payload estruturado ('1' / 0x31) antes de acionar o atuador
+    if (rxValue == "1") {
+      Serial.println("[BLE] Comando valido ('1') recebido!");
+      shouldPlayMario = true;
+    } else {
+      Serial.println("[BLE] Payload ignorado (comando invalido).");
+    }
+  }
+
   void onWrite(BLECharacteristic* pCharacteristic) override {
-    Serial.println("[BLE] Comando de som recebido (onWrite 1)!");
-    shouldPlayMario = true;
+    handleWrite(pCharacteristic);
   }
 
   void onWrite(BLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc) override {
-    Serial.println("[BLE] Comando de som recebido (onWrite 2)!");
-    shouldPlayMario = true;
+    handleWrite(pCharacteristic);
   }
 };
 
@@ -84,7 +119,7 @@ void setup() {
 
   // Inicializa PWM no pino 6 em 0V
   ledcAttach(BUZZER_PIN, 2000, 8);
-  ledcWrite(BUZZER_PIN, 0);
+  silenceBuzzer();
 
   playMarioTheme();
 
@@ -128,10 +163,29 @@ void setup() {
 }
 
 void loop() {
+  // 1. Acionamento remoto validado pelo app
   if (shouldPlayMario) {
     shouldPlayMario = false;
     Serial.println("[AUDIO] Tocando tema do Mario...");
     playMarioTheme();
   }
+
+  // 2. Decisão local anti-esquecimento ao desconectar
+  if (shouldPlayDisconnect) {
+    shouldPlayDisconnect = false;
+    Serial.println("[ALERTA] Perda de conexao! Emitindo 3 bipes locais...");
+    playDisconnectAlert();
+  }
+
+  // 3. Percepção e ação térmica local a cada 2 segundos
+  if (millis() - lastTempCheck >= 2000) {
+    lastTempCheck = millis();
+    float chipTemp = temperatureRead();
+    if (chipTemp >= TEMP_LIMIT_CELSIUS) {
+      Serial.printf("[TERMICO] Temperatura critica (%.1f C)! Acionando alarme...\n", chipTemp);
+      playThermalAlert();
+    }
+  }
+
   delay(15);
 }
