@@ -424,8 +424,14 @@ export default function App() {
   const isConnectingRef = useRef<boolean>(false);
   const currentStrengthRef = useRef<number>(0);
   const activeDeviceRef = useRef<Device | null>(null);
+  const isManualDisconnectRef = useRef<boolean>(false);
+  const savedTagsRef = useRef<SavedTag[]>(savedTags);
 
   const pulseAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    savedTagsRef.current = savedTags;
+  }, [savedTags]);
 
   const selectedTag = savedTags.find((t) => t.deviceId === selectedDeviceId) || null;
 
@@ -437,10 +443,10 @@ export default function App() {
   };
 
   // Captura localização GPS do iPhone e converte em endereço legível
-  const captureTagLocation = async (deviceId: string) => {
+  const captureTagLocation = async (deviceId: string): Promise<TagCoords | undefined> => {
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') return;
+      if (status !== 'granted') return undefined;
 
       const pos = await Location.getCurrentPositionAsync({
         accuracy: Location.Accuracy.Balanced,
@@ -473,8 +479,11 @@ export default function App() {
             : t
         )
       );
+
+      return coords;
     } catch {
       // Ignora falhas temporárias de GPS
+      return undefined;
     }
   };
 
@@ -740,6 +749,7 @@ export default function App() {
     setIsConnectedBle(false);
     setAudioChannelReady(false);
     isConnectingRef.current = false;
+    isManualDisconnectRef.current = false;
 
     setRadarStatus('Buscando sinal da tag...');
     bleManager.startDeviceScan([SERVICE_UUID], { allowDuplicates: true }, async (error, device) => {
@@ -774,16 +784,49 @@ export default function App() {
           setRadarStatus('Rastreando em tempo real');
           startConnectedRssiPolling(connectedDevice);
 
-          connectedDevice.onDisconnected(() => {
+          connectedDevice.onDisconnected(async () => {
+            const wasManual = isManualDisconnectRef.current;
+            isManualDisconnectRef.current = false;
+
             stopConnectedRssiPolling();
             isConnectingRef.current = false;
             setIsTracking(false);
             setIsConnectedBle(false);
             setAudioChannelReady(false);
             activeDeviceRef.current = null;
+
             // Salva a última localização conhecida no momento em que a tag ficou para trás
-            captureTagLocation(device.id);
-            setRadarStatus('Conexão encerrada • Último sinal salvo');
+            const latestCoords = await captureTagLocation(device.id);
+
+            if (wasManual) {
+              setRadarStatus('Rastreamento pausado');
+              return;
+            }
+
+            setRadarStatus('⚠️ Sinal perdido • Último local salvo');
+            Vibration.vibrate([0, 400, 150, 400]);
+
+            const currentTag =
+              savedTagsRef.current.find((t) => t.deviceId === device.id) || targetTag;
+            const tagWithFreshCoords: SavedTag = latestCoords
+              ? { ...currentTag, lastCoords: latestCoords }
+              : currentTag;
+
+            Alert.alert(
+              '⚠️ Você esqueceu sua tag!',
+              `A conexão com "${currentTag.emoji} ${currentTag.name}" foi perdida por queda de sinal ou afastamento. A última localização foi salva.`,
+              [
+                ...(tagWithFreshCoords.lastCoords
+                  ? [
+                      {
+                        text: 'Ver no Mapa',
+                        onPress: () => openTagInMaps(tagWithFreshCoords),
+                      },
+                    ]
+                  : []),
+                { text: 'OK', style: 'cancel' },
+              ]
+            );
           });
         } catch {
           isConnectingRef.current = false;
@@ -797,6 +840,7 @@ export default function App() {
   };
 
   const stopRadarTracking = async () => {
+    isManualDisconnectRef.current = true;
     bleManager.stopDeviceScan();
     stopConnectedRssiPolling();
     isConnectingRef.current = false;
