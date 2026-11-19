@@ -10,7 +10,10 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.anonymous.keep-near-app",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "O KeepNear usa sua localização para registrar onde suas tags foram vistas por último."
+        "NSLocationWhenInUseUsageDescription": "O KeepNear usa sua localização para registrar onde suas tags foram vistas por último.",
+        "UIBackgroundModes": [
+          "bluetooth-central"
+        ]
       }
     },
     "android": {
@@ -37,7 +40,7 @@
       [
         "@config-plugins/react-native-ble-plx",
         {
-          "isBackgroundEnabled": false,
+          "isBackgroundEnabled": true,
           "modes": [
             "central"
           ],
@@ -50,7 +53,8 @@
         {
           "locationWhenInUsePermission": "O KeepNear usa sua localização para registrar onde suas tags foram vistas por último."
         }
-      ]
+      ],
+      "expo-notifications"
     ]
   }
 }
